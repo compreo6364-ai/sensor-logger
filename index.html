@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>センサーロガー</title>
+<style>
+  :root { --bg:#fff; --fg:#1c1c1e; --sub:#6e6e73; --card:#f2f2f7; --acc:#0a84ff; --red:#ff3b30; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#000; --fg:#f2f2f7; --sub:#98989d; --card:#1c1c1e; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:16px; padding-top:max(16px, env(safe-area-inset-top)); background:var(--bg); color:var(--fg);
+         font-family:-apple-system, "Hiragino Sans", sans-serif; }
+  h1 { font-size:20px; margin:0 0 12px; }
+  .card { background:var(--card); border-radius:12px; padding:12px; margin-bottom:12px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:6px 12px; font-variant-numeric:tabular-nums; }
+  .k { color:var(--sub); font-size:12px; }
+  .v { font-size:17px; }
+  button { font-size:17px; padding:12px 16px; border:0; border-radius:10px; background:var(--acc); color:#fff; width:100%; margin-top:8px; }
+  button.stop { background:var(--red); }
+  button.sub { background:var(--card); color:var(--acc); border:1px solid var(--acc); width:auto; margin:4px 4px 0 0; padding:8px 12px; font-size:14px; }
+  label { font-size:14px; display:block; margin-top:8px; }
+  select, input { font-size:16px; padding:6px; width:100%; }
+  .note { font-size:12px; color:var(--sub); line-height:1.5; }
+  .sess { border-top:1px solid var(--sub); padding:8px 0; font-size:14px; }
+  #status { font-size:14px; color:var(--sub); margin-top:6px; min-height:1.4em; }
+</style>
+</head>
+<body>
+<h1>センサーロガー</h1>
+
+<div class="card">
+  <div class="grid">
+    <div><div class="k">加速度 x/y/z (m/s²)</div><div class="v" id="acc">-</div></div>
+    <div><div class="k">角速度 α/β/γ (°/s)</div><div class="v" id="gyr">-</div></div>
+    <div><div class="k">向き α/β/γ (°)</div><div class="v" id="ori">-</div></div>
+    <div><div class="k">騒音 (dB)</div><div class="v" id="db">-</div></div>
+    <div><div class="k">位置 緯度,経度</div><div class="v" id="pos">-</div></div>
+    <div><div class="k">速度 (km/h) / 精度 (m)</div><div class="v" id="spd">-</div></div>
+  </div>
+  <div class="k" style="margin-top:8px">記録行数: <span id="cnt">0</span> ／ 経過: <span id="el">0</span> 秒</div>
+</div>
+
+<div class="card">
+  <label>記録間隔
+    <select id="rate">
+      <option value="100">10 Hz</option>
+      <option value="50" selected>20 Hz</option>
+      <option value="20">50 Hz</option>
+    </select>
+  </label>
+  <label>騒音の校正オフセット (dBFS に足す値。目安 90)
+    <input id="off" type="number" value="90" inputmode="numeric">
+  </label>
+  <label>メモ(場所・条件など)
+    <input id="memo" type="text" placeholder="例: 国道21号 下り 通常運転">
+  </label>
+  <button id="go">記録開始</button>
+  <div id="status"></div>
+</div>
+
+<div class="card">
+  <div class="k" style="margin-bottom:4px">保存済みの記録</div>
+  <div id="list"><span class="note">なし</span></div>
+</div>
+
+<div class="note">
+  ・記録中は画面を点けたままにし、このページを前面に表示してください(画面を消す/別アプリに切り替えると止まります)。<br>
+  ・騒音は校正された騒音計ではないため、絶対値でなく相対比較として使ってください。<br>
+  ・運転中は操作せず、走り出す前に開始してください。スマホは向きを固定して置きます。<br>
+  ・iPhone の加速度は m/s² 単位で、静止時の重力は z 付近に約 ±9.8 が出ます(符号は Android と逆のことがあります)。
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const HEADER = ["t_ms","iso_time","ax","ay","az","agx","agy","agz","rot_alpha","rot_beta","rot_gamma",
+                "ori_alpha","ori_beta","ori_gamma","db","lat","lon","alt","speed_ms","gps_acc","heading","gps_ts"];
+
+// ---- IndexedDB ----
+let db;
+function openDB() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open("sensorlog", 1);
+    r.onupgradeneeded = () => {
+      const d = r.result;
+      d.createObjectStore("sessions", { keyPath: "id" });
+      d.createObjectStore("rows", { autoIncrement: true }).createIndex("sid", "sid");
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+const tx = (stores, mode, fn) => new Promise((res, rej) => {
+  const t = db.transaction(stores, mode);
+  const out = fn(t);
+  t.oncomplete = () => res(out && out.result !== undefined ? out.result : out);
+  t.onerror = () => rej(t.error);
+});
+
+// ---- 最新センサー値 ----
+const S = { a:[null,null,null], ag:[null,null,null], rot:[null,null,null], ori:[null,null,null],
+            db:null, gps:null };
+let running = false, timer = null, buf = [], total = 0, t0 = 0, sid = null;
+let stream = null, actx = null, analyser = null, tbuf = null, wl = null, watchId = null;
+
+const f = (x, n=2) => (x == null ? "-" : x.toFixed(n));
+
+function onMotion(e) {
+  const a = e.acceleration, g = e.accelerationIncludingGravity, r = e.rotationRate;
+  if (a) S.a = [a.x, a.y, a.z];
+  if (g) S.ag = [g.x, g.y, g.z];
+  if (r) S.rot = [r.alpha, r.beta, r.gamma];
+}
+function onOri(e) { S.ori = [e.alpha, e.beta, e.gamma]; }
+
+function readDb() {
+  analyser.getFloatTimeDomainData(tbuf);
+  let s = 0;
+  for (let i = 0; i < tbuf.length; i++) s += tbuf[i] * tbuf[i];
+  const rms = Math.sqrt(s / tbuf.length);
+  const dbfs = 20 * Math.log10(Math.max(rms, 1e-8));
+  return dbfs + (parseFloat($("off").value) || 0);
+}
+
+function tick() {
+  const now = Date.now();
+  S.db = readDb();
+  const g = S.gps;
+  buf.push([now - t0, new Date(now).toISOString(), ...S.a, ...S.ag, ...S.rot, ...S.ori, S.db,
+            g ? g.lat : null, g ? g.lon : null, g ? g.alt : null, g ? g.spd : null,
+            g ? g.acc : null, g ? g.hdg : null, g ? g.ts : null]);
+  total++;
+}
+
+async function flush() {
+  if (!buf.length) return;
+  const rows = buf; buf = [];
+  const mine = sid;
+  await tx(["rows"], "readwrite", t => { const st = t.objectStore("rows"); rows.forEach(r => st.add({ sid: mine, r })); });
+}
+
+function updateView() {
+  $("acc").textContent = S.a.map(v => f(v)).join(" / ");
+  $("gyr").textContent = S.rot.map(v => f(v, 1)).join(" / ");
+  $("ori").textContent = S.ori.map(v => f(v, 0)).join(" / ");
+  $("db").textContent = S.db == null ? "-" : S.db.toFixed(1);
+  const g = S.gps;
+  $("pos").textContent = g ? g.lat.toFixed(5) + ", " + g.lon.toFixed(5) : "-";
+  $("spd").textContent = g ? (g.spd == null ? "-" : (g.spd * 3.6).toFixed(1)) + " / " + f(g.acc, 0) : "-";
+  $("cnt").textContent = total;
+  $("el").textContent = running ? Math.round((Date.now() - t0) / 1000) : 0;
+}
+
+async function acquireWake() {
+  try { if ("wakeLock" in navigator) wl = await navigator.wakeLock.request("screen"); } catch (e) {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (running && document.visibilityState === "visible") acquireWake();
+});
+
+async function start() {
+  const st = $("status");
+  // iOS: 許可要求はタップ直後に同期的に呼ぶ必要がある
+  const reqs = [];
+  if (typeof DeviceMotionEvent !== "undefined" && DeviceMotionEvent.requestPermission) reqs.push(DeviceMotionEvent.requestPermission());
+  if (typeof DeviceOrientationEvent !== "undefined" && DeviceOrientationEvent.requestPermission) reqs.push(DeviceOrientationEvent.requestPermission());
+  const mic = navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  try {
+    const res = await Promise.all(reqs);
+    if (res.some(x => x !== "granted")) { st.textContent = "モーションセンサーが許可されませんでした。Safari の設定で許可してください。"; return; }
+    stream = await mic;
+  } catch (e) { st.textContent = "許可エラー: " + e.message; return; }
+
+  actx = new (window.AudioContext || window.webkitAudioContext)();
+  await actx.resume();
+  const src = actx.createMediaStreamSource(stream);
+  analyser = actx.createAnalyser(); analyser.fftSize = 2048;
+  tbuf = new Float32Array(analyser.fftSize);
+  src.connect(analyser);
+
+  window.addEventListener("devicemotion", onMotion);
+  window.addEventListener("deviceorientation", onOri);
+  watchId = navigator.geolocation.watchPosition(p => {
+    const c = p.coords;
+    S.gps = { lat:c.latitude, lon:c.longitude, alt:c.altitude, spd:c.speed, acc:c.accuracy, hdg:c.heading, ts:p.timestamp };
+  }, e => { st.textContent = "位置情報エラー: " + e.message; }, { enableHighAccuracy:true, maximumAge:0 });
+
+  t0 = Date.now(); total = 0; buf = [];
+  sid = t0;
+  await tx(["sessions"], "readwrite", t => t.objectStore("sessions").put({
+    id: sid, start: new Date(t0).toISOString(), memo: $("memo").value, rate: $("rate").value, offset: $("off").value }));
+  running = true;
+  await acquireWake();
+  timer = setInterval(tick, parseInt($("rate").value, 10));
+  window._ui = setInterval(updateView, 250);
+  window._fl = setInterval(flush, 5000);
+  $("go").textContent = "記録停止"; $("go").classList.add("stop");
+  st.textContent = "記録中…";
+}
+
+async function stop() {
+  running = false;
+  clearInterval(timer); clearInterval(window._ui); clearInterval(window._fl);
+  window.removeEventListener("devicemotion", onMotion);
+  window.removeEventListener("deviceorientation", onOri);
+  if (watchId != null) navigator.geolocation.clearWatch(watchId);
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (actx) actx.close();
+  if (wl) { try { await wl.release(); } catch (e) {} wl = null; }
+  await flush();
+  $("go").textContent = "記録開始"; $("go").classList.remove("stop");
+  $("status").textContent = total + " 行を保存しました。";
+  updateView();
+  renderList();
+}
+
+$("go").addEventListener("click", () => { running ? stop() : start(); });
+
+// ---- 保存済み一覧・CSV ----
+async function getRows(id) {
+  return new Promise((res, rej) => {
+    const out = [];
+    const c = db.transaction("rows").objectStore("rows").index("sid").openCursor(IDBKeyRange.only(id));
+    c.onsuccess = () => { const cur = c.result; if (cur) { out.push(cur.value.r); cur.continue(); } else res(out); };
+    c.onerror = () => rej(c.error);
+  });
+}
+
+async function exportCsv(id) {
+  const rows = await getRows(id);
+  const csv = [HEADER.join(",")].concat(rows.map(r => r.map(v => v == null ? "" : v).join(","))).join("\n");
+  const name = "sensor_" + new Date(id).toISOString().replace(/[:.]/g, "-") + ".csv";
+  const file = new File([csv], name, { type: "text/csv" });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file], title: name }); return; } catch (e) { if (e.name === "AbortError") return; }
+  }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(file); a.download = name; document.body.appendChild(a); a.click(); a.remove();
+}
+
+async function removeSession(id) {
+  if (!confirm("この記録を削除しますか?")) return;
+  await new Promise((res, rej) => {
+    const t = db.transaction(["rows", "sessions"], "readwrite");
+    const c = t.objectStore("rows").index("sid").openKeyCursor(IDBKeyRange.only(id));
+    c.onsuccess = () => { const cur = c.result; if (cur) { t.objectStore("rows").delete(cur.primaryKey); cur.continue(); } };
+    t.objectStore("sessions").delete(id);
+    t.oncomplete = res; t.onerror = () => rej(t.error);
+  });
+  renderList();
+}
+
+async function renderList() {
+  const list = $("list");
+  const sessions = await new Promise(res => {
+    const r = db.transaction("sessions").objectStore("sessions").getAll();
+    r.onsuccess = () => res(r.result);
+  });
+  if (!sessions.length) { list.innerHTML = '<span class="note">なし</span>'; return; }
+  list.innerHTML = "";
+  for (const s of sessions.sort((a, b) => b.id - a.id)) {
+    const n = await new Promise(res => {
+      const r = db.transaction("rows").objectStore("rows").index("sid").count(IDBKeyRange.only(s.id));
+      r.onsuccess = () => res(r.result);
+    });
+    const div = document.createElement("div"); div.className = "sess";
+    const title = document.createElement("div");
+    title.textContent = new Date(s.id).toLocaleString("ja-JP") + "  " + n + "行  " + (s.memo || "");
+    const b1 = document.createElement("button"); b1.className = "sub"; b1.textContent = "CSV書き出し";
+    b1.onclick = () => exportCsv(s.id);
+    const b2 = document.createElement("button"); b2.className = "sub"; b2.textContent = "削除";
+    b2.onclick = () => removeSession(s.id);
+    div.append(title, b1, b2); list.appendChild(div);
+  }
+}
+
+openDB().then(d => { db = d; renderList(); }).catch(e => { $("status").textContent = "保存領域を開けません: " + e.message; });
+if (!window.isSecureContext) $("status").textContent = "https で開かないとセンサーが使えません。";
+</script>
+</body>
+</html>
